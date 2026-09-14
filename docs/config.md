@@ -85,7 +85,9 @@ Add a comment on the authorized_keys line so Discord shows a device name, for ex
 
 ## Discord messages
 
-Components V2 (`flags` 32768): Container + Text Display, no legacy embeds.
+Components V2 (`flags` 32768): Container + Text Displays + Separator. No `content` / legacy embeds.
+
+Time is a Discord timestamp (`<t:unix:f> · <t:unix:R>`), so each viewer sees their own timezone and a relative "2 minutes ago".
 
 - System warning: orange; very high: red; recovery: green; reboot: purple
 - SSH login: green; logout: blue; **root**: red

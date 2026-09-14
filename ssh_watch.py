@@ -10,12 +10,11 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
 from checks import format_duration
-from discord_webhook import COLOR_ROOT, COLOR_SSH_LOGIN, COLOR_SSH_LOGOUT
+from discord_webhook import COLOR_ROOT, COLOR_SSH_LOGIN, COLOR_SSH_LOGOUT, format_discord_time
 
 log = logging.getLogger("server-alerts.ssh")
 
@@ -63,7 +62,7 @@ LOGOUT_DEDUPE_SEC = 12
 REAP_GRACE_SEC = 15
 REAP_INTERVAL_SEC = 15
 
-SendFn = Callable[[str, str, int], None]
+SendFn = Callable[[str, str, int, float], None]
 
 
 def session_key(user: str, ip: str, port: str) -> str:
@@ -178,12 +177,6 @@ def parse_journal_ts(entry: dict[str, Any]) -> float:
         return int(raw) / 1_000_000
     except (TypeError, ValueError):
         return time.time()
-
-
-def format_local(ts: float) -> str:
-    dt = datetime.fromtimestamp(ts).astimezone()
-    tz = dt.tzname() or dt.strftime("%z")
-    return f"{dt.strftime('%Y-%m-%d %H:%M:%S')} {tz}"
 
 
 def is_preauth_message(message: str) -> bool:
@@ -460,9 +453,9 @@ class SshWatcher:
             f"**Method:** `{method}`\n"
             f"{format_key_fields(method, key_type, key_fp, key_name)}"
             f"**Host:** `{self.hostname}`\n"
-            f"**Time:** {format_local(ts)}"
+            f"**Time:** {format_discord_time(ts)}"
         )
-        self.send(title, body, color)
+        self.send(title, body, color, ts)
         log.info(
             "ssh login user=%s ip=%s port=%s method=%s key=%s %s name=%s",
             user,
@@ -525,9 +518,9 @@ class SshWatcher:
             f"{format_key_fields(method, key_type, key_fp, key_name)}"
             f"**Duration:** {duration}\n"
             f"**Host:** `{self.hostname}`\n"
-            f"**Time:** {format_local(ts)}"
+            f"**Time:** {format_discord_time(ts)}"
         )
-        self.send(title, body, color)
+        self.send(title, body, color, ts)
         log.info("ssh logout user=%s ip=%s port=%s duration=%s", user, ip, port, duration)
 
     def _pop_session(

@@ -19,6 +19,7 @@ from checks import AlertState, SystemMonitor, Thresholds, cpu_count, read_boot_i
 from discord_webhook import (
     COLOR_SSH_LOGIN,
     COLOR_WARNING,
+    format_discord_time,
     is_placeholder_url,
     send as discord_send,
 )
@@ -164,15 +165,17 @@ class AlertApp:
             body=body,
             color=color,
             username=self.hostname,
+            timestamp=time.time(),
         )
 
-    def _send_ssh(self, title: str, body: str, color: int) -> None:
+    def _send_ssh(self, title: str, body: str, color: int, timestamp: float | None = None) -> None:
         discord_send(
             self.cfg["webhooks"]["ssh"],
             title=title,
             body=body,
             color=color,
             username=self.hostname,
+            timestamp=timestamp,
         )
         self.persist()
 
@@ -226,16 +229,19 @@ class AlertApp:
 
 def test_webhooks(cfg: dict[str, Any]) -> int:
     hostname = cfg.get("hostname") or socket.gethostname()
+    now = time.time()
     system_ok = discord_send(
         cfg["webhooks"]["system"],
         title="Test system alert",
         body=(
             f"**Host:** `{hostname}`\n"
             f"**Status:** system webhook OK\n"
+            f"**Time:** {format_discord_time(now)}\n"
             f"If you can see this message, the system alerts channel is connected."
         ),
         color=COLOR_WARNING,
         username=hostname,
+        timestamp=now,
     )
     ssh_ok = discord_send(
         cfg["webhooks"]["ssh"],
@@ -248,10 +254,11 @@ def test_webhooks(cfg: dict[str, Any]) -> int:
             f"**Key:** `ED25519 SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abc`\n"
             f"**Key name:** `laptop-example`\n"
             f"**Host:** `{hostname}`\n"
-            f"If you can see this message, the SSH alerts channel is connected."
+            f"**Time:** {format_discord_time(now)}"
         ),
         color=COLOR_SSH_LOGIN,
         username=hostname,
+        timestamp=now,
     )
     if system_ok and ssh_ok:
         print("both webhooks OK")

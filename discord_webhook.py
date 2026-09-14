@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 import urllib.error
 import urllib.request
@@ -24,9 +25,11 @@ TYPE_SEPARATOR = 14
 TYPE_TEXT = 10
 TYPE_CONTAINER = 17
 SPACING_SMALL = 1
+SPACING_LARGE = 2
 
 MAX_RETRIES = 3
 TIMEOUT_SEC = 15
+RE_FIELD_LINE = re.compile(r"^\*\*(.+?):\*\*\s*(.*)$")
 
 
 def is_placeholder_url(url: str | None) -> bool:
@@ -54,7 +57,75 @@ def _append_query(url: str, query: str) -> str:
     return f"{url}{sep}{query}"
 
 
-def build_payload(title: str, body: str, color: int, username: str) -> dict[str, Any]:
+def format_discord_time(ts: float | None = None) -> str:
+    """Absolute + relative Discord timestamp, rendered in each viewer's timezone."""
+    unix = int(ts if ts is not None else time.time())
+    return f"<t:{unix}:f> · <t:{unix}:R>"
+
+
+def parse_body_fields(body: str) -> tuple[list[tuple[str, str]], list[str]]:
+    fields: list[tuple[str, str]] = []
+    extra: list[str] = []
+    for raw in (body or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        match = RE_FIELD_LINE.match(line)
+        if match:
+            fields.append((match.group(1).strip(), match.group(2).strip()))
+        else:
+            extra.append(line)
+    return fields, extra
+
+
+def _text(content: str) -> dict[str, Any]:
+    return {"type": TYPE_TEXT, "content": content}
+
+
+def _separator(*, divider: bool = True, spacing: int = SPACING_SMALL) -> dict[str, Any]:
+    return {"type": TYPE_SEPARATOR, "divider": divider, "spacing": spacing}
+
+
+def _field_value(value: str) -> str:
+    value = value or "—"
+    if value.startswith("`") or value.startswith("<t:") or value.startswith("http"):
+        return value
+    return f"`{value}`"
+
+
+def _fields_markdown(fields: list[tuple[str, str]]) -> str:
+    lines: list[str] = []
+    for name, value in fields:
+        lines.append(f"**{name}**  {_field_value(value)}")
+    return "\n".join(lines)
+
+
+def build_payload(
+    title: str,
+    body: str,
+    color: int,
+    username: str,
+    timestamp: float | None = None,
+) -> dict[str, Any]:
+    fields, extra = parse_body_fields(body)
+    time_text = ""
+    visible: list[tuple[str, str]] = []
+    for name, value in fields:
+        if name.lower() == "time":
+            time_text = value
+            continue
+        visible.append((name, value))
+
+    inner: list[dict[str, Any]] = [_text(f"## {title}")]
+    if visible or extra:
+        inner.append(_separator(spacing=SPACING_SMALL))
+    if visible:
+        inner.append(_text(_fields_markdown(visible)))
+    if extra:
+        inner.append(_text("\n".join(extra)))
+    inner.append(_separator(spacing=SPACING_LARGE))
+    inner.append(_text(f"-# {time_text or format_discord_time(timestamp)}"))
+
     return {
         "flags": IS_COMPONENTS_V2,
         "username": (username or "server-alerts")[:80],
@@ -63,15 +134,7 @@ def build_payload(title: str, body: str, color: int, username: str) -> dict[str,
             {
                 "type": TYPE_CONTAINER,
                 "accent_color": int(color) & 0xFFFFFF,
-                "components": [
-                    {"type": TYPE_TEXT, "content": f"## {title}"},
-                    {
-                        "type": TYPE_SEPARATOR,
-                        "divider": True,
-                        "spacing": SPACING_SMALL,
-                    },
-                    {"type": TYPE_TEXT, "content": body},
-                ],
+                "components": inner,
             }
         ],
     }
@@ -84,12 +147,13 @@ def send(
     body: str,
     color: int,
     username: str,
+    timestamp: float | None = None,
 ) -> bool:
     if is_placeholder_url(url):
         log.warning("skip send %s: webhook URL is not set", title)
         return False
 
-    payload = build_payload(title, body, color, username)
+    payload = build_payload(title, body, color, username, timestamp=timestamp)
     data = json.dumps(payload).encode("utf-8")
     target = _append_query(url.strip(), "with_components=true")
     headers = {
