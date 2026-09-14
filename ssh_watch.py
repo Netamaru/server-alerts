@@ -70,6 +70,15 @@ def session_key(user: str, ip: str, port: str) -> str:
     return f"{user}|{ip}|{port}"
 
 
+def _journal_unit_name(unit: str) -> str:
+    unit = unit.strip()
+    if not unit:
+        return "ssh.service"
+    if unit.endswith(".service") or unit.endswith(".socket") or unit.endswith(".scope"):
+        return unit
+    return f"{unit}.service"
+
+
 def parse_keyinfo(raw: str | None) -> tuple[str, str, str]:
     if not raw:
         return "", "", ""
@@ -589,23 +598,20 @@ class SshWatcher:
         # Follow syslog identifiers, not only -u ssh/sshd. After PAM opens a
         # session, systemd-logind moves sshd into session-*.scope so logout
         # lines never appear in journalctl -u ssh.
+        #
+        # journalctl only accepts "+" between FIELD=value terms. Do not mix
+        # it with -t / -u ("+" can only be used between terms).
         cmd = ["journalctl", "-o", "json", "-n", "0", "-f", "--no-pager", "-q"]
         idents = [ident for ident in self.journal_identifiers if ident]
-        units = [self.journal_unit] if self.journal_unit else []
-        if not idents and not units:
-            units = ["ssh"]
+        unit = (self.journal_unit or "").strip()
         groups: list[list[str]] = []
         if idents:
-            ident_args: list[str] = []
-            for ident in idents:
-                ident_args.extend(["-t", ident])
-            groups.append(ident_args)
-            comm_args: list[str] = []
-            for ident in idents:
-                comm_args.extend(["_COMM=" + ident])
-            groups.append(comm_args)
-        for unit in units:
-            groups.append(["-u", unit])
+            groups.append([f"SYSLOG_IDENTIFIER={ident}" for ident in idents])
+            groups.append([f"_COMM={ident}" for ident in idents])
+        if unit:
+            groups.append([f"_SYSTEMD_UNIT={_journal_unit_name(unit)}"])
+        if not groups:
+            groups.append(["SYSLOG_IDENTIFIER=sshd"])
         for index, group in enumerate(groups):
             if index:
                 cmd.append("+")
