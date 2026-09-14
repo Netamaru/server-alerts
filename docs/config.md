@@ -68,7 +68,11 @@ On Ubuntu the SSH unit is named `ssh`, not `sshd`. On a server without nginx, re
 
 ## `ssh.journal_unit`
 
-Unit followed with `journalctl -u ...`. Default `"ssh"` (Ubuntu/Debian). Use `"sshd"` on RHEL/Fedora/Arch.
+Extra systemd unit OR'd into the journal follow. Default `"ssh"` (Ubuntu/Debian). Use `"sshd"` on RHEL/Fedora/Arch.
+
+Logout lines are often *not* on this unit. After PAM opens a session, logind moves sshd into `session-*.scope`, so `journalctl -u ssh` still sees login but misses disconnect. The watcher follows `SYSLOG_IDENTIFIER` / `_COMM` `sshd`, `sshd-session`, and `sshd-auth` as well.
+
+Optional `ssh.journal_identifiers` overrides that list.
 
 Only **successful** logins and logouts are sent. Failed passwords / invalid users are ignored.
 

@@ -84,8 +84,11 @@ Components V2 needs `flags: 32768` and the `?with_components=true` query. Do not
 **`--test-webhooks` asks you to fill config**  
 The URL is still `CHANGE_ME` or is not `https://.../api/webhooks/...`. Edit `config.json`; do not commit that file.
 
+**SSH login works, logout does not**  
+Logout is often logged after sshd is moved to `session-*.scope`, so `journalctl -u ssh` never sees it. Current builds follow `sshd` / `sshd-session` by identifier. Restart `server-alerts` after updating. A backup reaper also closes tracked sessions when `ss` shows the TCP peer is gone.
+
 **SSH alerts never appear**  
-`ssh.journal_unit` is wrong. Check:
+`ssh.journal_unit` is wrong (login only used to depend on it). Check:
 
 ```bash
 systemctl list-units --type=service | grep -E 'ssh'

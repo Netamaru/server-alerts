@@ -133,10 +133,15 @@ class AlertApp:
             saved_boot_id=str(self.state.get("boot_id") or ""),
         )
         ssh_cfg = cfg.get("ssh") or {}
+        idents = ssh_cfg.get("journal_identifiers")
+        watcher_kw: dict[str, Any] = {}
+        if isinstance(idents, list) and idents:
+            watcher_kw["journal_identifiers"] = [str(item) for item in idents if item]
         self.ssh = SshWatcher(
             journal_unit=str(ssh_cfg.get("journal_unit") or "ssh"),
             hostname=self.hostname,
             send=self._send_ssh,
+            **watcher_kw,
         )
         self.ssh.load_sessions(self.state.get("ssh_sessions"), time.time())
 

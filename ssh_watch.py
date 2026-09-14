@@ -38,7 +38,19 @@ RE_KEYGEN_LF = re.compile(
     r"^\s*\d+\s+(SHA256:[A-Za-z0-9+/=]+)\s+(.*?)\s+\(([^)]+)\)\s*$"
 )
 RE_DISCONNECT = re.compile(
-    r"^Disconnected from user (?P<user>\S+) (?P<ip>\S+) port (?P<port>\d+)"
+    r"Disconnected from user (?P<user>\S+) (?P<ip>\S+) port (?P<port>\d+)"
+)
+RE_RECEIVED_DISCONNECT = re.compile(
+    r"Received disconnect from (?P<ip>\S+) port (?P<port>\d+)"
+)
+RE_CONNECTION_CLOSED = re.compile(
+    r"Connection closed by(?: user (?P<user>\S+))? (?P<ip>\S+) port (?P<port>\d+)"
+)
+RE_CLOSE_SESSION = re.compile(
+    r"Close session: user (?P<user>\S+) from (?P<ip>\S+) port (?P<port>\d+)"
+)
+RE_TIMEOUT = re.compile(
+    r"Timeout, client not responding from user (?P<user>\S+) (?P<ip>\S+) port (?P<port>\d+)"
 )
 RE_SESSION_OPEN = re.compile(
     r"session opened for user (?P<user>[^\s(]+)(?:\(uid=\d+\))?"
@@ -46,6 +58,10 @@ RE_SESSION_OPEN = re.compile(
 RE_SESSION_CLOSE = re.compile(
     r"session closed for user (?P<user>[^\s(]+)"
 )
+DEFAULT_JOURNAL_IDENTIFIERS = ("sshd", "sshd-session", "sshd-auth")
+LOGOUT_DEDUPE_SEC = 12
+REAP_GRACE_SEC = 15
+REAP_INTERVAL_SEC = 15
 
 SendFn = Callable[[str, str, int], None]
 
@@ -161,6 +177,30 @@ def format_local(ts: float) -> str:
     return f"{dt.strftime('%Y-%m-%d %H:%M:%S')} {tz}"
 
 
+def is_preauth_message(message: str) -> bool:
+    lower = message.lower()
+    return (
+        "[preauth]" in lower
+        or " authenticating user " in lower
+        or " invalid user " in lower
+    )
+
+
+def normalize_ip(ip: str) -> str:
+    ip = ip.strip().strip("[]")
+    if ip.startswith("::ffff:"):
+        return ip[7:]
+    return ip
+
+
+def peer_aliases(ip: str, port: str) -> set[tuple[str, str]]:
+    ip = normalize_ip(ip)
+    aliases = {(ip, port)}
+    if ip.startswith("::ffff:"):
+        aliases.add((ip[7:], port))
+    return aliases
+
+
 @dataclass
 class SshSession:
     user: str
@@ -171,6 +211,7 @@ class SshSession:
     key_type: str = ""
     key_fp: str = ""
     key_name: str = ""
+    pid: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -182,6 +223,7 @@ class SshSession:
             "key_type": self.key_type,
             "key_fp": self.key_fp,
             "key_name": self.key_name,
+            "pid": self.pid,
         }
 
     @classmethod
@@ -195,6 +237,7 @@ class SshSession:
             key_type=str(data.get("key_type") or ""),
             key_fp=str(data.get("key_fp") or ""),
             key_name=str(data.get("key_name") or ""),
+            pid=str(data.get("pid") or ""),
         )
 
 
@@ -203,29 +246,39 @@ class SshWatcher:
     journal_unit: str
     hostname: str
     send: SendFn
+    journal_identifiers: list[str] = field(
+        default_factory=lambda: list(DEFAULT_JOURNAL_IDENTIFIERS)
+    )
     sessions: dict[str, SshSession] = field(default_factory=dict)
     stop_event: threading.Event = field(default_factory=threading.Event)
     proc: subprocess.Popen[str] | None = None
     keys: KeyCatalog = field(default_factory=KeyCatalog)
     _pending_by_user: dict[str, str] = field(default_factory=dict)
     _login_dedupe: dict[str, float] = field(default_factory=dict)
+    _logout_dedupe: dict[str, float] = field(default_factory=dict)
     _pending_key_by_pid: dict[str, tuple[str, str]] = field(default_factory=dict)
+    _sessions_by_pid: dict[str, str] = field(default_factory=dict)
+    _lock: threading.RLock = field(default_factory=threading.RLock)
 
     def snapshot_sessions(self) -> dict[str, dict[str, Any]]:
-        return {key: sess.to_dict() for key, sess in self.sessions.items()}
+        with self._lock:
+            return {key: sess.to_dict() for key, sess in self.sessions.items()}
 
     def load_sessions(self, data: dict[str, Any] | None, now: float) -> None:
         if not data:
             return
         cutoff = now - 48 * 3600
-        for key, raw in data.items():
-            try:
-                sess = SshSession.from_dict(raw)
-            except Exception:
-                continue
-            if sess.started < cutoff:
-                continue
-            self.sessions[key] = sess
+        with self._lock:
+            for key, raw in data.items():
+                try:
+                    sess = SshSession.from_dict(raw)
+                except Exception:
+                    continue
+                if sess.started < cutoff:
+                    continue
+                self.sessions[key] = sess
+                if sess.pid:
+                    self._sessions_by_pid[sess.pid] = key
 
     def request_stop(self) -> None:
         self.stop_event.set()
@@ -234,6 +287,8 @@ class SshWatcher:
             proc.terminate()
 
     def run(self) -> None:
+        reaper = threading.Thread(target=self._reap_loop, name="ssh-reap", daemon=True)
+        reaper.start()
         while not self.stop_event.is_set():
             try:
                 self._follow_once()
@@ -277,7 +332,11 @@ class SshWatcher:
                 key_type=key_type,
                 key_fp=key_fp,
                 key_name=key_name,
+                pid=pid,
             )
+            return
+
+        if is_preauth_message(message):
             return
 
         disconnect = RE_DISCONNECT.search(message)
@@ -287,6 +346,51 @@ class SshWatcher:
                 ip=disconnect.group("ip"),
                 port=disconnect.group("port"),
                 ts=ts,
+                pid=pid,
+            )
+            return
+
+        close_session = RE_CLOSE_SESSION.search(message)
+        if close_session:
+            self._on_logout(
+                user=close_session.group("user"),
+                ip=close_session.group("ip"),
+                port=close_session.group("port"),
+                ts=ts,
+                pid=pid,
+            )
+            return
+
+        timed_out = RE_TIMEOUT.search(message)
+        if timed_out:
+            self._on_logout(
+                user=timed_out.group("user"),
+                ip=timed_out.group("ip"),
+                port=timed_out.group("port"),
+                ts=ts,
+                pid=pid,
+            )
+            return
+
+        conn_closed = RE_CONNECTION_CLOSED.search(message)
+        if conn_closed:
+            self._on_logout(
+                user=conn_closed.group("user") or "",
+                ip=conn_closed.group("ip"),
+                port=conn_closed.group("port"),
+                ts=ts,
+                pid=pid,
+            )
+            return
+
+        received = RE_RECEIVED_DISCONNECT.search(message)
+        if received:
+            self._on_logout(
+                user="",
+                ip=received.group("ip"),
+                port=received.group("port"),
+                ts=ts,
+                pid=pid,
             )
             return
 
@@ -299,16 +403,12 @@ class SshWatcher:
             recent = self._login_dedupe.get(user, 0)
             if ts - recent < 8:
                 return
-            self._on_login(user=user, ip="unknown", port="?", method="session", ts=ts)
+            self._on_login(user=user, ip="unknown", port="?", method="session", ts=ts, pid=pid)
             return
 
         closed = RE_SESSION_CLOSE.search(message)
         if closed:
-            user = closed.group("user")
-            matches = [k for k, s in self.sessions.items() if s.user == user]
-            if len(matches) == 1:
-                sess = self.sessions[matches[0]]
-                self._on_logout(user=sess.user, ip=sess.ip, port=sess.port, ts=ts)
+            self._on_logout(user=closed.group("user"), ip="", port="", ts=ts, pid=pid)
             return
 
     def _on_login(
@@ -321,9 +421,10 @@ class SshWatcher:
         key_type: str = "",
         key_fp: str = "",
         key_name: str = "",
+        pid: str = "",
     ) -> None:
         key = session_key(user, ip, port)
-        self.sessions[key] = SshSession(
+        sess = SshSession(
             user=user,
             ip=ip,
             port=port,
@@ -332,9 +433,14 @@ class SshWatcher:
             key_type=key_type,
             key_fp=key_fp,
             key_name=key_name,
+            pid=pid,
         )
-        self._pending_by_user[user] = key
-        self._login_dedupe[user] = ts
+        with self._lock:
+            self.sessions[key] = sess
+            self._pending_by_user[user] = key
+            self._login_dedupe[user] = ts
+            if pid:
+                self._sessions_by_pid[pid] = key
         root = user == "root"
         title = "SSH login (root)" if root else "SSH login"
         color = COLOR_ROOT if root else COLOR_SSH_LOGIN
@@ -359,27 +465,53 @@ class SshWatcher:
             key_name or "-",
         )
 
-    def _on_logout(self, user: str, ip: str, port: str, ts: float) -> None:
-        key = session_key(user, ip, port)
-        sess = self.sessions.pop(key, None)
+    def _on_logout(
+        self,
+        user: str,
+        ip: str,
+        port: str,
+        ts: float,
+        pid: str = "",
+    ) -> None:
+        sess = self._pop_session(user=user, ip=ip, port=port, pid=pid)
         if sess is None:
-            # Match leftover session for this user+ip if port differs.
-            for existing_key, existing in list(self.sessions.items()):
-                if existing.user == user and existing.ip == ip:
-                    sess = self.sessions.pop(existing_key)
-                    break
-        duration = format_duration(ts - sess.started) if sess else "unknown"
-        method = sess.method if sess else "unknown"
-        key_type = sess.key_type if sess else ""
-        key_fp = sess.key_fp if sess else ""
-        key_name = sess.key_name if sess else ""
+            # PAM "session closed" has no IP/port. Without a unique tracked
+            # session, do not guess — a later disconnect line or the reaper
+            # will close the right one.
+            if not user or (not ip and not port):
+                return
+        if sess:
+            user = sess.user
+            if not ip or ip in {"?", "unknown"}:
+                ip = sess.ip
+            if not port or port == "?":
+                port = sess.port
+            method = sess.method
+            key_type = sess.key_type
+            key_fp = sess.key_fp
+            key_name = sess.key_name
+            duration = format_duration(ts - sess.started)
+        else:
+            method = "unknown"
+            key_type = key_fp = key_name = ""
+            duration = "unknown"
+        dedupe_key = session_key(user, ip or "?", port or "?")
+        last = self._logout_dedupe.get(dedupe_key, 0)
+        if ts - last < LOGOUT_DEDUPE_SEC:
+            return
+        self._logout_dedupe[dedupe_key] = ts
+        if len(self._logout_dedupe) > 256:
+            cutoff = ts - 600
+            self._logout_dedupe = {
+                key: seen for key, seen in self._logout_dedupe.items() if seen >= cutoff
+            }
         root = user == "root"
         title = "SSH logout (root)" if root else "SSH logout"
         color = COLOR_ROOT if root else COLOR_SSH_LOGOUT
         body = (
             f"**User:** `{user}`\n"
-            f"**IP:** `{ip}`\n"
-            f"**Port:** `{port}`\n"
+            f"**IP:** `{ip or "unknown"}`\n"
+            f"**Port:** `{port or "?"}`\n"
             f"**Method:** `{method}`\n"
             f"{format_key_fields(method, key_type, key_fp, key_name)}"
             f"**Duration:** {duration}\n"
@@ -389,19 +521,151 @@ class SshWatcher:
         self.send(title, body, color)
         log.info("ssh logout user=%s ip=%s port=%s duration=%s", user, ip, port, duration)
 
+    def _pop_session(
+        self,
+        user: str = "",
+        ip: str = "",
+        port: str = "",
+        pid: str = "",
+    ) -> SshSession | None:
+        ip = normalize_ip(ip) if ip else ip
+        specific_ip = bool(ip and ip not in {"?", "unknown"})
+        specific_port = bool(port and port != "?")
+        with self._lock:
+            if user and specific_ip and specific_port:
+                key = session_key(user, ip, port)
+                sess = self.sessions.pop(key, None)
+                if sess:
+                    self._forget_pid(key)
+                    return sess
+            if specific_ip and specific_port:
+                for key, sess in list(self.sessions.items()):
+                    if normalize_ip(sess.ip) == ip and sess.port == port:
+                        if not user or sess.user == user:
+                            self.sessions.pop(key)
+                            self._forget_pid(key)
+                            return sess
+            if pid:
+                key = self._sessions_by_pid.get(pid)
+                if key and key in self.sessions:
+                    sess = self.sessions[key]
+                    port_ok = not specific_port or sess.port == port
+                    ip_ok = not specific_ip or normalize_ip(sess.ip) == ip
+                    user_ok = not user or sess.user == user
+                    if port_ok and ip_ok and user_ok:
+                        self.sessions.pop(key)
+                        self._forget_pid(key)
+                        return sess
+            # A concrete port that matched nothing must not steal another session.
+            if specific_port:
+                return None
+            if user and specific_ip:
+                matches = [
+                    key
+                    for key, sess in self.sessions.items()
+                    if sess.user == user and normalize_ip(sess.ip) == ip
+                ]
+                if len(matches) == 1:
+                    key = matches[0]
+                    sess = self.sessions.pop(key)
+                    self._forget_pid(key)
+                    return sess
+                return None
+            if user:
+                matches = [key for key, sess in self.sessions.items() if sess.user == user]
+                if len(matches) == 1:
+                    key = matches[0]
+                    sess = self.sessions.pop(key)
+                    self._forget_pid(key)
+                    return sess
+        return None
+
+    def _forget_pid(self, key: str) -> None:
+        dead = [pid for pid, mapped in self._sessions_by_pid.items() if mapped == key]
+        for pid in dead:
+            self._sessions_by_pid.pop(pid, None)
+
+    def _journal_cmd(self) -> list[str]:
+        # Follow syslog identifiers, not only -u ssh/sshd. After PAM opens a
+        # session, systemd-logind moves sshd into session-*.scope so logout
+        # lines never appear in journalctl -u ssh.
+        cmd = ["journalctl", "-o", "json", "-n", "0", "-f", "--no-pager", "-q"]
+        idents = [ident for ident in self.journal_identifiers if ident]
+        units = [self.journal_unit] if self.journal_unit else []
+        if not idents and not units:
+            units = ["ssh"]
+        groups: list[list[str]] = []
+        if idents:
+            ident_args: list[str] = []
+            for ident in idents:
+                ident_args.extend(["-t", ident])
+            groups.append(ident_args)
+            comm_args: list[str] = []
+            for ident in idents:
+                comm_args.extend(["_COMM=" + ident])
+            groups.append(comm_args)
+        for unit in units:
+            groups.append(["-u", unit])
+        for index, group in enumerate(groups):
+            if index:
+                cmd.append("+")
+            cmd.extend(group)
+        return cmd
+
+    def _reap_loop(self) -> None:
+        while not self.stop_event.wait(REAP_INTERVAL_SEC):
+            try:
+                self._reap_dead_sessions()
+            except Exception:
+                log.exception("ssh session reap failed")
+
+    def _reap_dead_sessions(self) -> None:
+        peers = self._list_ssh_peers()
+        if peers is None:
+            return
+        now = time.time()
+        dead: list[SshSession] = []
+        with self._lock:
+            for sess in list(self.sessions.values()):
+                if sess.ip in {"", "?", "unknown"} or sess.port in {"", "?"}:
+                    continue
+                if now - sess.started < REAP_GRACE_SEC:
+                    continue
+                if peer_aliases(sess.ip, sess.port).isdisjoint(peers):
+                    dead.append(sess)
+        for sess in dead:
+            self._on_logout(sess.user, sess.ip, sess.port, now, pid=sess.pid)
+
+    def _list_ssh_peers(self) -> set[tuple[str, str]] | None:
+        try:
+            result = subprocess.run(
+                ["ss", "-tnH"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+            log.debug("ss not available for ssh reap: %s", exc)
+            return None
+        if result.returncode != 0:
+            return None
+        peers: set[tuple[str, str]] = set()
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            peer = parts[-1]
+            if peer.count(":") < 1:
+                continue
+            ip, _, port = peer.rpartition(":")
+            ip = normalize_ip(ip)
+            if ip and port.isdigit():
+                peers.update(peer_aliases(ip, port))
+        return peers
+
     def _follow_once(self) -> None:
-        cmd = [
-            "journalctl",
-            "-u",
-            self.journal_unit,
-            "-o",
-            "json",
-            "-n",
-            "0",
-            "-f",
-            "--no-pager",
-            "-q",
-        ]
+        cmd = self._journal_cmd()
         log.info("following ssh journal: %s", " ".join(cmd))
         self.proc = subprocess.Popen(
             cmd,
