@@ -1,0 +1,17 @@
+[Unit]
+Description=Server Discord Alerts (system + SSH)
+After=network-online.target systemd-journald.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__INSTALL_DIR__
+ExecStart=__PYTHON__ __INSTALL_DIR__/main.py
+Restart=always
+RestartSec=5
+User=root
+Group=root
+SyslogIdentifier=server-alerts
+
+[Install]
+WantedBy=multi-user.target

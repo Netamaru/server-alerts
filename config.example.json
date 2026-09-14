@@ -1,0 +1,22 @@
+{
+  "webhooks": {
+    "system": "https://discord.com/api/webhooks/CHANGE_ME/CHANGE_ME",
+    "ssh": "https://discord.com/api/webhooks/CHANGE_ME/CHANGE_ME"
+  },
+  "hostname": null,
+  "poll_interval_sec": 15,
+  "cooldown_sec": 300,
+  "state_path": "/var/lib/server-alerts/state.json",
+  "thresholds": {
+    "cpu_percent": 85,
+    "cpu_duration_sec": 120,
+    "ram_percent": 90,
+    "disk_percent": 85,
+    "load_per_core": 1.5
+  },
+  "disk_mounts": ["/"],
+  "services": ["ssh", "docker", "nginx"],
+  "ssh": {
+    "journal_unit": "ssh"
+  }
+}

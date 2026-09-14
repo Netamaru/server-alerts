@@ -1,0 +1,9 @@
+config.json
+state.json
+*.pyc
+__pycache__/
+.venv/
+venv/
+*.tmp
+*.service
+!systemd/*.service.in
